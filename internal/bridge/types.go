@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Version = "0.3.10"
+const Version = "0.3.11"
 const Provider = "cline-pass"
 const PluginID = "clinepassbridge"
 
@@ -27,6 +27,25 @@ const (
 // A pinned set is a routing allow-list, not a budget. Keep it small enough to
 // stay reviewable in the UI.
 const maxModelProviders = 8
+
+// A capability filter is an extra routing condition, not a preference list, so
+// the cap only guards against pasting an entire catalogue into one model.
+const maxModelCapabilities = 16
+
+// defaultCapabilitiesFor is the capability filter a fresh DeepSeek mapping
+// carries. The gateway silently ignores `only` for credentials diverted to the
+// private pool, so the allow-list alone cannot pin such an account; narrowing
+// the routing candidates by capability is what makes the pin take effect.
+// Capability slugs are model-agnostic gateway vocabulary, so seeding them is
+// safe for every model and an explicit empty list still means "do not filter".
+var defaultCapabilities = []string{"vision", "implicit-caching"}
+
+func defaultCapabilitiesFor(id, upstreamID string) []string {
+	if strings.Contains(strings.ToLower(id+" "+upstreamID), "deepseek") {
+		return append([]string{}, defaultCapabilities...)
+	}
+	return nil
+}
 
 // localBackoffLabel is the label the UI shows, and filters by, for a request the
 // plugin suppressed locally. Such a request never reached an upstream, so it has
@@ -130,6 +149,9 @@ type Model struct {
 	ID               string                  `json:"id" yaml:"id"`
 	UpstreamID       string                  `json:"upstream_id" yaml:"upstream_id"`
 	Providers        []string                `json:"providers" yaml:"providers"`
+	// Has narrows routing by upstream capability. The gateway honours it where
+	// it quietly ignores `only`, so this is what actually pins such a model.
+	Has []string `json:"has" yaml:"has"`
 }
 type Config struct {
 	ReasoningMapping         *ReasoningMappingConfig `json:"reasoning_mapping,omitempty" yaml:"reasoning_mapping,omitempty"` // Legacy global mapping; migrated during validation.
@@ -149,7 +171,7 @@ type Config struct {
 }
 
 func defaultConfig() Config {
-	return Config{DataDir: "plugins/clinepassbridge-data", BaseURL: "https://api.cline.bot/api/v1", Models: []Model{{ID: "deepseek-v4.1-flash-1017", UpstreamID: "cline-pass/deepseek-v4.1-flash-1017", Providers: []string{"deepseek"}}}, NonstreamMode: "stream-aggregate", ClientRetryCompatibility: true, StreamIdleCutoffEnabled: false, StreamIdleTimeoutSeconds: 20, ProviderPolicy: ProviderPolicyConfig, TimeoutSeconds: 600, LogRetention: 1000, MaxResponseBytes: 64 << 20}
+	return Config{DataDir: "plugins/clinepassbridge-data", BaseURL: "https://api.cline.bot/api/v1", Models: []Model{{ID: "deepseek-v4.1-flash-1017", UpstreamID: "cline-pass/deepseek-v4.1-flash-1017", Providers: []string{"deepseek"}, Has: append([]string{}, defaultCapabilities...)}}, NonstreamMode: "stream-aggregate", ClientRetryCompatibility: true, StreamIdleCutoffEnabled: false, StreamIdleTimeoutSeconds: 20, ProviderPolicy: ProviderPolicyConfig, TimeoutSeconds: 600, LogRetention: 1000, MaxResponseBytes: 64 << 20}
 }
 
 // Scalar settings support partial updates, but supplied collections replace the
@@ -253,6 +275,29 @@ func (c *Config) validate() error {
 			pinned[slug] = true
 			m.Providers[n] = slug
 		}
+		// Same rule as the allow-list: a nil list seeds the DeepSeek default,
+		// an explicitly empty list means the operator wants no capability
+		// filter at all. The default is only seeded for a pinned model: the
+		// filter exists to make an allow-list binding, so a model left on
+		// automatic routing keeps both routing fields out of its requests.
+		if m.Has == nil && len(m.Providers) > 0 {
+			m.Has = defaultCapabilitiesFor(m.ID, m.UpstreamID)
+		}
+		if len(m.Has) > maxModelCapabilities {
+			return fail(400, "a model can filter on at most 16 upstream capabilities")
+		}
+		capabilities := map[string]bool{}
+		for n, raw := range m.Has {
+			slug := strings.ToLower(strings.TrimSpace(raw))
+			if slug == "" || strings.ContainsAny(slug, " \r\n\t") {
+				return fail(400, "upstream capabilities must be nonempty slugs without whitespace")
+			}
+			if capabilities[slug] {
+				return fail(400, "upstream capabilities must be unique within a model")
+			}
+			capabilities[slug] = true
+			m.Has[n] = slug
+		}
 	}
 	for i := range c.ServerTools {
 		if err := c.ServerTools[i].validate(); err != nil {
@@ -278,6 +323,18 @@ func (c Config) pinnedProviders(alias string) []string {
 	for _, m := range c.Models {
 		if m.ID == alias {
 			return append([]string{}, m.Providers...)
+		}
+	}
+	return nil
+}
+
+// pinnedCapabilities returns the configured capability filter for a
+// client-facing model alias. An empty result means the request carries no
+// capability condition and the gateway routes on the allow-list alone.
+func (c Config) pinnedCapabilities(alias string) []string {
+	for _, m := range c.Models {
+		if m.ID == alias {
+			return append([]string{}, m.Has...)
 		}
 	}
 	return nil

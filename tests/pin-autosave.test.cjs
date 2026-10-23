@@ -28,9 +28,9 @@ const code = [
 const clone = value => JSON.parse(JSON.stringify(value));
 const key = model => JSON.stringify([model.id, model.upstream_id]);
 const fixtures = () => [
-  { id: 'a', upstream_id: 'cline-pass/a', providers: ['old-a'], reasoning_mapping: { enabled: true, rules: { low: 'medium' } } },
-  { id: 'b', upstream_id: 'cline-pass/b', providers: ['old-b'], reasoning_mapping: { enabled: false, rules: {} } },
-  { id: 'untouched', upstream_id: 'cline-pass/untouched', providers: ['existing'], reasoning_mapping: { enabled: true, rules: { high: 'max' } } },
+  { id: 'a', upstream_id: 'cline-pass/a', providers: ['old-a'], has: ['vision'], reasoning_mapping: { enabled: true, rules: { low: 'medium' } } },
+  { id: 'b', upstream_id: 'cline-pass/b', providers: ['old-b'], has: [], reasoning_mapping: { enabled: false, rules: {} } },
+  { id: 'untouched', upstream_id: 'cline-pass/untouched', providers: ['existing'], has: ['implicit-caching'], reasoning_mapping: { enabled: true, rules: { high: 'max' } } },
 ];
 const settle = () => new Promise(resolve => setImmediate(resolve));
 function deferred() {
@@ -39,11 +39,14 @@ function deferred() {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
+// 两类行内输入共用同一套事件入口，因此匹配器对两个选择器都返回 true。
+const pinInputMatches = selector => selector === 'input[data-model-key]' || selector === 'input[data-capability-key]';
 
 function page(intercept = async () => {}) {
   const initial = fixtures();
   const nodes = new Map();
   const inputs = new Map();
+  const capabilityInputs = new Map();
   const calls = [];
   const timers = new Map();
   let now = 0;
@@ -74,6 +77,7 @@ function page(intercept = async () => {}) {
   }
   function buildInputs() {
     inputs.clear();
+    capabilityInputs.clear();
     for (const model of state.models) {
       const badge = { textContent: '', classList: { toggle() {} } };
       const row = { querySelector: () => badge };
@@ -81,12 +85,22 @@ function page(intercept = async () => {}) {
         dataset: { modelKey: key(model) }, value: model.providers.join(', '),
         selectionStart: 0, selectionEnd: 0,
         closest: () => row,
-        matches: selector => selector === 'input[data-model-key]',
+        matches: pinInputMatches,
+      });
+      capabilityInputs.set(model.id, {
+        dataset: { capabilityKey: key(model) }, value: (model.has || []).join(', '),
+        selectionStart: 0, selectionEnd: 0,
+        closest: () => row,
+        matches: pinInputMatches,
       });
     }
   }
   buildInputs();
-  node('pinModelList').querySelectorAll = selector => selector === 'input[data-model-key]' ? [...inputs.values()] : [];
+  node('pinModelList').querySelectorAll = selector => {
+    if (selector === 'input[data-model-key]') return [...inputs.values()];
+    if (selector === 'input[data-capability-key]') return [...capabilityInputs.values()];
+    return [];
+  };
   node('providerPolicy').value = server.provider_policy;
   const document = { activeElement: null };
   const context = vm.createContext({
@@ -121,7 +135,7 @@ function page(intercept = async () => {}) {
   });
   vm.runInContext(code, context);
   return {
-    state, nodes, inputs, calls, initial, server,
+    state, nodes, inputs, capabilityInputs, calls, initial, server,
     get maxActive() { return maxActive; },
     async advance(milliseconds) {
       const target = now + milliseconds;
@@ -138,6 +152,12 @@ function page(intercept = async () => {}) {
     },
     edit(id, value) {
       const input = inputs.get(id);
+      input.value = value;
+      document.activeElement = input;
+      return node('pinModelList').emit('input', { target: input });
+    },
+    editCapabilities(id, value) {
+      const input = capabilityInputs.get(id);
       input.value = value;
       document.activeElement = input;
       return node('pinModelList').emit('input', { target: input });
@@ -169,6 +189,37 @@ test('白名单防抖合并保存，保留模型其他属性并将清空值保�
   assert.deepEqual(view.server.models, expected);
   assert.deepEqual(clone(view.state.models), expected);
   assert.equal(view.nodes.get('pinModelsState').dataset.phase, 'saved');
+});
+
+test('能力过滤与白名单同时修改只写一次，清空能力保存为 []', async () => {
+  const view = page();
+  await view.editCapabilities('a', 'Vision, implicit-caching');
+  await view.edit('a', 'vendor-a');
+  await view.editCapabilities('b', '');
+  await view.advance(649);
+  assert.equal(view.calls.length, 0);
+  await view.advance(1);
+  assert.equal(view.calls.length, 1);
+  const expected = clone(view.initial);
+  expected[0].providers = ['vendor-a'];
+  expected[0].has = ['vision', 'implicit-caching'];
+  expected[1].has = [];
+  assert.deepEqual(view.calls[0].body.models, expected);
+  assert.deepEqual(view.server.models, expected);
+  assert.deepEqual(clone(view.state.models), expected);
+  assert.equal(view.nodes.get('pinModelsState').dataset.phase, 'saved');
+});
+
+test('仅修改能力过滤时也走同一保存通道并回显服务端值', async () => {
+  const view = page();
+  await view.editCapabilities('untouched', 'vision');
+  await view.advance(650);
+  assert.equal(view.calls.length, 1);
+  assert.deepEqual(view.calls[0].body.models[2].has, ['vision']);
+  assert.deepEqual(view.server.models[2].has, ['vision']);
+  // 白名单未被触碰的模型保持原样
+  assert.deepEqual(view.calls[0].body.models[0].providers, ['old-a']);
+  assert.deepEqual(view.calls[0].body.models[0].has, ['vision']);
 });
 
 test('保存挂起期间继续修改两个模型，旧响应保留输入且后续写入串行完成', async () => {

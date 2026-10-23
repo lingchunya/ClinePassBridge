@@ -206,13 +206,41 @@ func TestClientProviderRoutingMergesGatewayAndTopLevelFields(t *testing.T) {
 }
 
 func TestClientProviderRoutingPreservesExplicitEmptyFields(t *testing.T) {
-	s, err := registerService(t, modelConfig(t, "    providers: [deepseek, wafer]\nprovider_policy: client\n"))
+	s, err := registerService(t, modelConfig(t, "    providers: [deepseek, wafer]\n    has: []\nprovider_policy: client\n"))
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	gateway := gatewayOf(t, s, `{"messages":[{"role":"user","content":"hello"}],"provider":{"only":["novita"],"order":["novita"]},"providerOptions":{"gateway":{"only":[],"order":null}}}`)
 	if got := string(jsonBytes(gateway)); got != `{"only":[],"order":null}` {
 		t.Errorf("gateway = %s, want explicit empty fields instead of fallback values", got)
+	}
+}
+
+func TestClientCapabilityFilterIsPreservedAndFilled(t *testing.T) {
+	s, err := registerService(t, modelConfig(t, "    providers: [deepseek]\n    has: [vision, implicit-caching]\nprovider_policy: client\n"))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// Under client policy the caller wins for the keys it sets, and the
+	// configured capability filter fills the gap it left out.
+	gateway := gatewayOf(t, s, `{"messages":[{"role":"user","content":"hello"}],"providerOptions":{"gateway":{"has":["tool-calling"]}}}`)
+	if got := strings.Join(slugs(gateway["has"]), ","); got != "tool-calling" {
+		t.Errorf("has = %q, want the client value tool-calling", got)
+	}
+	bare := gatewayOf(t, s, `{"messages":[{"role":"user","content":"hello"}]}`)
+	if got := strings.Join(slugs(bare["has"]), ","); got != "vision,implicit-caching" {
+		t.Errorf("has = %q, want the configured fallback vision,implicit-caching", got)
+	}
+}
+
+func TestConfigPolicyReplacesClientCapabilityFilter(t *testing.T) {
+	s, err := registerService(t, modelConfig(t, "    providers: [deepseek]\n    has: [vision, implicit-caching]\nprovider_policy: config\n"))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	gateway := gatewayOf(t, s, `{"messages":[{"role":"user","content":"hello"}],"providerOptions":{"gateway":{"has":["tool-calling"]}}}`)
+	if got := strings.Join(slugs(gateway["has"]), ","); got != "vision,implicit-caching" {
+		t.Errorf("has = %q, want the configured vision,implicit-caching", got)
 	}
 }
 
@@ -271,6 +299,60 @@ func TestProvidersAreNormalisedOnSave(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesAreNormalisedOnSave(t *testing.T) {
+	s, err := registerService(t, modelConfig(t, "    providers: [deepseek]\n    has:\n      - \" Vision \"\n      - IMPLICIT-CACHING\n"))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if got := strings.Join(s.config().Models[0].Has, ","); got != "vision,implicit-caching" {
+		t.Errorf("has = %q, want normalised vision,implicit-caching", got)
+	}
+	gateway := gatewayOf(t, s, `{"messages":[{"role":"user","content":"hello"}]}`)
+	if got := strings.Join(slugs(gateway["has"]), ","); got != "vision,implicit-caching" {
+		t.Errorf("gateway has = %q, want normalised vision,implicit-caching", got)
+	}
+}
+
+func TestCapabilityFilterValidation(t *testing.T) {
+	cases := []struct {
+		name   string
+		extra  string
+		reason string
+	}{
+		{"duplicate", "    has:\n      - vision\n      - vision\n", "unique"},
+		{"empty entry", "    has:\n      - \"\"\n", "empty"},
+		{"blank entry", "    has:\n      - \"a b\"\n", "whitespace"},
+		{"too many", "    has:\n      - a\n      - b\n      - c\n      - d\n      - e\n      - f\n      - g\n      - h\n      - i\n      - j\n      - k\n      - l\n      - m\n      - n\n      - o\n      - p\n      - q\n", "at most 16"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := registerService(t, modelConfig(t, "    providers: [deepseek]\n"+tt.extra))
+			if err == nil {
+				t.Fatalf("expected rejection (%s)", tt.reason)
+			}
+			if !strings.Contains(err.Error(), tt.reason) {
+				t.Errorf("error = %q, want it to mention %q", err.Error(), tt.reason)
+			}
+		})
+	}
+}
+
+func TestExplicitEmptyCapabilityFilterDisablesTheDefault(t *testing.T) {
+	// An empty list is how an operator turns the filter off; it must stay empty
+	// through validation instead of being re-seeded with the DeepSeek default.
+	s, err := registerService(t, modelConfig(t, "    providers: [deepseek]\n    has: []\n"))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if got := s.config().Models[0].Has; got == nil || len(got) != 0 {
+		t.Fatalf("has = %#v, want an explicit empty list", got)
+	}
+	gateway := gatewayOf(t, s, `{"messages":[{"role":"user","content":"hello"}]}`)
+	if value, ok := gateway["has"]; ok {
+		t.Errorf("gateway has = %v, want the filter left out entirely", value)
+	}
+}
+
 func TestProviderConfigValidation(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -309,6 +391,26 @@ func TestDeepSeekModelIsPinnedByDefault(t *testing.T) {
 				if got := strings.Join(slugs(gateway[key]), ","); got != "deepseek" {
 					t.Errorf("a fresh DeepSeek mapping should default %s to deepseek, got %q", key, got)
 				}
+			}
+			if got := strings.Join(slugs(gateway["has"]), ","); got != "vision,implicit-caching" {
+				t.Errorf("a fresh DeepSeek mapping should default has to vision,implicit-caching, got %q", got)
+			}
+		})
+	}
+}
+
+func TestCapabilityFilterIsNotSeededForAutomaticRouting(t *testing.T) {
+	// A capability filter only exists to make an allow-list binding, so a model
+	// left on automatic routing must not gain one.
+	for _, upstream := range []string{"cline-pass/deepseek-v4.1-flash", "cline-pass/deepseek-v4.1-flash-1017"} {
+		t.Run(upstream, func(t *testing.T) {
+			config := strings.ReplaceAll(modelConfig(t, "    providers: []\n"), "cline-pass/deepseek-v4.1-flash", upstream)
+			s, err := registerService(t, config)
+			if err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			if got := s.config().Models[0].Has; len(got) != 0 {
+				t.Errorf("has = %v, want no capability filter without an allow-list", got)
 			}
 		})
 	}

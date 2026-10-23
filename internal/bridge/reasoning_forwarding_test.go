@@ -75,7 +75,9 @@ func TestProviderRoutingPreservesModelOptions(t *testing.T) {
 		{"client_pinned_fills_missing_order", "client", "[deepseek, wafer]", `{"only":["alibaba"]}`, `{"only":["alibaba"],"order":["deepseek","wafer"]}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := registerService(t, modelConfig(t, "    providers: "+tt.providers+"\nprovider_policy: "+tt.policy+"\nnonstream_mode: stream-aggregate\n"))
+			// The capability filter has its own cases, so this table switches it
+			// off explicitly and stays focused on the allow-list.
+			s, err := registerService(t, modelConfig(t, "    providers: "+tt.providers+"\n    has: []\nprovider_policy: "+tt.policy+"\nnonstream_mode: stream-aggregate\n"))
 			if err != nil {
 				t.Fatalf("register: %v", err)
 			}

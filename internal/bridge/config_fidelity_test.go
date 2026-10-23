@@ -144,6 +144,35 @@ func TestConfigFidelityCopyPreservesProviderShapeAndIsolation(t *testing.T) {
 	}
 }
 
+func TestConfigFidelityCopyPreservesCapabilityShapeAndIsolation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		has  []string
+	}{
+		{name: "nil", has: nil},
+		{name: "explicit-empty", has: []string{}},
+		{name: "populated", has: []string{"vision", "implicit-caching"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewService()
+			s.cfg.Models = []Model{{ID: "model", UpstreamID: "cline-pass/model", Providers: []string{"deepseek"}, Has: tc.has}}
+			before := jsonBytes(s.config())
+			copied := s.config()
+			if !reflect.DeepEqual(copied.Models[0].Has, tc.has) {
+				t.Error("config copy changed nil, empty or populated capability semantics")
+			}
+			if len(copied.Models[0].Has) > 0 {
+				copied.Models[0].Has[0] = "tool-calling"
+			} else {
+				copied.Models[0].Has = append(copied.Models[0].Has, "tool-calling")
+			}
+			if !bytes.Equal(before, jsonBytes(s.config())) {
+				t.Error("editing a config copy changed the service capability filter")
+			}
+		})
+	}
+}
+
 func TestConfigFidelityUnrotatedCredentialSavePreservesUnknown(t *testing.T) {
 	for _, tc := range []struct {
 		name          string

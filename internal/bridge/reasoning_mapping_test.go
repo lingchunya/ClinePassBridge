@@ -644,7 +644,13 @@ func TestReasoningMappingConfigPUTModelReorder(t *testing.T) {
 	}
 	response := observabilityManagement(t, s, "PUT", "/config", nil, jsonBytes(map[string]any{"models": models}), 200)
 	want := cfg
-	want.Models = []Model{models[0], {ID: "deepseek-flash", UpstreamID: cfg.Models[0].UpstreamID, Providers: []string{"deepseek"}, ReasoningMapping: defaultMapping}}
+	// Capabilities are seeded for a pinned model that carries no filter, just
+	// like providers, and stay untouched on a model that already had one.
+	pinned := models[0]
+	pinned.Has = []string{"vision", "implicit-caching"}
+	want.Models = []Model{
+		pinned, {ID: "deepseek-flash", UpstreamID: cfg.Models[0].UpstreamID, Providers: []string{"deepseek"}, Has: []string{"vision", "implicit-caching"}, ReasoningMapping: defaultMapping},
+	}
 	var returned Config
 	if err := json.Unmarshal(response.Body, &returned); err != nil {
 		t.Fatal(err)
